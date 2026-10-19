@@ -1,0 +1,38 @@
+# Local/demo stack. Ports are bound to localhost only; put TLS in front (see README) before exposing them.
+x-env: &env
+  CLOUDPULSE_API_KEYS: "${CLOUDPULSE_ADMIN_KEY:?set in .env}:admin,${CLOUDPULSE_VIEWER_KEY:?set in .env}:viewer,${CLOUDPULSE_AGENT_KEY:?set in .env}:agent"
+  CLOUDPULSE_DB_PATH: /data/cloudpulse.db
+  AWS_REGION: "${AWS_REGION:-us-east-1}"
+
+services:
+  api:
+    build: .
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *env
+    volumes: ["cloudpulse-data:/data"]
+    ports: ["127.0.0.1:8000:8000"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  dashboard:
+    build: .
+    command: ["dashboard", "--host", "0.0.0.0", "--port", "8501"]
+    environment:
+      CLOUDPULSE_API_URL: http://api:8000
+      CLOUDPULSE_DASHBOARD_API_KEY: "${CLOUDPULSE_VIEWER_KEY}"  # use the admin key to enable alert acknowledgement
+    depends_on:
+      api: { condition: service_healthy }
+    ports: ["127.0.0.1:8501:8501"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  cloudpulse-data:

@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudPulse v2 - EC2 host (API + dashboard + agent), private encrypted S3 bucket, SNS alerts, CloudWatch dashboard
+  and alarms, optional S3 gateway VPC endpoint, least-privilege IAM. No SSH (use SSM Session Manager). nginx terminates TLS.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet (route to an internet gateway) in the VPC above.
+  RouteTableId:
+    Type: String
+    Default: ""
+    Description: Optional. Route table of that subnet; if set, an S3 gateway VPC endpoint is created (lower latency, no NAT/internet path to S3).
+  AllowedCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR allowed to reach the dashboard/API over HTTPS (for example 203.0.113.7/32).
+  AlertEmail:
+    Type: String
+    Description: Address subscribed to the SNS alert topic (confirm the subscription email).
+  RepoUrl:
+    Type: String
+    Description: HTTPS git URL of this project, installed with pip.
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  HasRouteTable: !Not [!Equals [!Ref RouteTableId, ""]]
+
+Resources:
+  TransferBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          - Id: expire-loadgen-objects
+            Status: Enabled
+            Prefix: cloudpulse-loadgen/
+            ExpirationInDays: 1
+
+  BucketTlsOnlyPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TransferBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt TransferBucket.Arn, !Sub "${TransferBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: HasRouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds: [!Ref RouteTableId]
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties: { DisplayName: CloudPulse alerts }
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: "sns:Publish"
+            Resource: !Ref AlertTopic
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
+          - Sid: AllowAccountOwner
+            Effect: Allow
+            Principal: { AWS: !Ref "AWS::AccountId" }
+            Action: ["sns:Publish", "sns:Subscribe", "sns:GetTopicAttributes", "sns:SetTopicAttributes"]
+            Resource: !Ref AlertTopic
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties: { TopicArn: !Ref AlertTopic, Protocol: email, Endpoint: !Ref AlertEmail }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: "sts:AssumeRole" }
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: cloudpulse-least-privilege
+          PolicyDocument:
+            Statement:
+              - { Sid: ListBucket, Effect: Allow, Action: "s3:ListBucket", Resource: !GetAtt TransferBucket.Arn }
+              - Sid: ObjectReadWrite
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject"]
+                Resource: !Sub "${TransferBucket.Arn}/*"
+              - Sid: PublishMetricsToOwnNamespaceOnly
+                Effect: Allow
+                Action: "cloudwatch:PutMetricData"
+                Resource: "*"
+                Condition: { StringEquals: { "cloudwatch:namespace": CloudPulse } }
+              - { Sid: PublishAlerts, Effect: Allow, Action: "sns:Publish", Resource: !Ref AlertTopic }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref InstanceRole] }
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudPulse HTTPS only (no SSH)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr }
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }   # IMDSv2 only
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeType: gp3, VolumeSize: 20, Encrypted: true }
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref SecurityGroup]
+      Tags: [{ Key: Name, Value: cloudpulse }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf install -y python3.11 python3.11-pip git nginx openssl
+          useradd --system --home-dir /var/lib/cloudpulse cloudpulse || true
+          python3.11 -m venv /opt/cloudpulse
+          /opt/cloudpulse/bin/pip install "cloudpulse[all] @ git+${RepoUrl}"
+
+          # ---- secrets: one file per consumer (least privilege), all root-only ----------------------------
+          # The API's file holds only SHA-256 hashes of the keys; raw keys live only with the party that uses them.
+          umask 077
+          mkdir -p /etc/cloudpulse
+          ADMIN=$(openssl rand -hex 24); VIEWER=$(openssl rand -hex 24); AGENT=$(openssl rand -hex 24)
+          HP='sha256$'
+          h() { printf %s "$1" | sha256sum | cut -d' ' -f1; }
+          cat > /etc/cloudpulse/api.env <<ENV
+          CLOUDPULSE_API_KEYS=$HP$(h "$ADMIN"):admin,$HP$(h "$VIEWER"):viewer,$HP$(h "$AGENT"):agent
+          CLOUDPULSE_DB_PATH=/var/lib/cloudpulse/cloudpulse.db
+          CLOUDPULSE_SNS_TOPIC_ARN=${AlertTopic}
+          AWS_REGION=${AWS::Region}
+          HOME=/var/lib/cloudpulse
+          ENV
+          cat > /etc/cloudpulse/dashboard.env <<ENV
+          CLOUDPULSE_API_URL=http://127.0.0.1:8000
+          CLOUDPULSE_DASHBOARD_API_KEY=$VIEWER
+          HOME=/var/lib/cloudpulse
+          ENV
+          cat > /etc/cloudpulse/agent.env <<ENV
+          CLOUDPULSE_API_URL=http://127.0.0.1:8000
+          CLOUDPULSE_AGENT_API_KEY=$AGENT
+          CLOUDPULSE_SPOOL_PATH=/var/lib/cloudpulse/spool.jsonl
+          AWS_REGION=${AWS::Region}
+          ENV
+          cat > /etc/cloudpulse/admin.env <<ENV
+          # For humans: alert acknowledgement and admin API calls.
+          CLOUDPULSE_ADMIN_API_KEY=$ADMIN
+          ENV
+          umask 022
+
+          for svc in api dashboard; do
+            if [ $svc = api ]; then CMD="serve --host 127.0.0.1 --port 8000"; else CMD="dashboard --host 127.0.0.1 --port 8501"; fi
+            cat > /etc/systemd/system/cloudpulse-$svc.service <<UNIT
+          [Unit]
+          Description=CloudPulse $svc
+          After=network-online.target
+          [Service]
+          User=cloudpulse
+          StateDirectory=cloudpulse
+          EnvironmentFile=/etc/cloudpulse/$svc.env
+          ExecStart=/opt/cloudpulse/bin/cloudpulse $CMD
+          Restart=always
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          PrivateTmp=true
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          done
+
+          # ---- TLS termination (self-signed for demos; use ACM/ALB or Let's Encrypt in production) ---------
+          mkdir -p /etc/nginx/tls
+          openssl req -x509 -nodes -newkey rsa:2048 -days 365 -subj "/CN=cloudpulse" \
+            -keyout /etc/nginx/tls/key.pem -out /etc/nginx/tls/cert.pem
+          chmod 600 /etc/nginx/tls/key.pem
+          cat > /etc/nginx/conf.d/cloudpulse.conf <<'NGINX'
+          limit_req_zone $binary_remote_addr zone=cp_api:10m rate=20r/s;
+          server_tokens off;
+          server {
+            listen 443 ssl;
+            ssl_certificate /etc/nginx/tls/cert.pem;
+            ssl_certificate_key /etc/nginx/tls/key.pem;
+            ssl_protocols TLSv1.2 TLSv1.3;
+            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header X-Frame-Options "DENY" always;
+            location /api/ {
+              limit_req zone=cp_api burst=40 nodelay;
+              client_max_body_size 2m;
+              proxy_pass http://127.0.0.1:8000;
+              proxy_set_header Host $host;
+              proxy_set_header X-Forwarded-Proto https;
+            }
+            location = /health { proxy_pass http://127.0.0.1:8000; }
+            location / {
+              proxy_pass http://127.0.0.1:8501;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_read_timeout 86400;
+            }
+          }
+          NGINX
+
+          systemctl daemon-reload
+          systemctl enable --now cloudpulse-api cloudpulse-dashboard nginx
+
+  # Native CloudWatch alarms keep working even if the CloudPulse API itself is down (defence in depth).
+  UploadFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: At least one failed upload in a minute
+      Namespace: CloudPulse
+      MetricName: TransferFailure
+      Dimensions: [{ Name: Direction, Value: upload }, { Name: InstanceId, Value: !Ref Instance }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  DownloadFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: At least one failed download in a minute
+      Namespace: CloudPulse
+      MetricName: TransferFailure
+      Dimensions: [{ Name: Direction, Value: download }, { Name: InstanceId, Value: !Ref Instance }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: CloudPulse
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {"title": "Throughput (MB/s)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 300,
+            "metrics": [[{"expression": "SEARCH('{CloudPulse,Direction,InstanceId} MetricName=\"ThroughputMBps\"', 'Average', 300)", "id": "t1"}]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {"title": "Latency (ms)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 300,
+            "metrics": [[{"expression": "SEARCH('{CloudPulse,Direction,InstanceId} MetricName=\"LatencyMs\"', 'Average', 300)", "id": "l1"}]]}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {"title": "Failures and retries", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+            "metrics": [[{"expression": "SEARCH('{CloudPulse,Direction,InstanceId} MetricName=\"TransferFailure\"', 'Sum', 300)", "id": "f1"}],
+                        [{"expression": "SEARCH('{CloudPulse,Direction,InstanceId} MetricName=\"Retries\"', 'Sum', 300)", "id": "r1"}]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {"title": "CPU and memory (%)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 300,
+            "metrics": [[{"expression": "SEARCH('{CloudPulse,Direction,InstanceId} MetricName=\"CpuUtilization\"', 'Average', 300)", "id": "c1"}],
+                        [{"expression": "SEARCH('{CloudPulse,Direction,InstanceId} MetricName=\"MemoryUtilization\"', 'Average', 300)", "id": "m1"}]]}}
+        ]}
+
+Outputs:
+  BucketName: { Value: !Ref TransferBucket }
+  AlertTopicArn: { Value: !Ref AlertTopic }
+  InstanceId: { Value: !Ref Instance }
+  DashboardUrl: { Value: !Sub "https://${Instance.PublicIp}/" }
+  CloudWatchDashboard: { Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=CloudPulse" }
